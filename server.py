@@ -2,15 +2,22 @@ import sys
 import re
 import socket
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 
 FORMAT = 'utf-8'
-MAX_MSG_LEN = 65000 # 1 character is 1 byte
+MAX_MSG_LEN = 65000 # 1 character is 1 byte.
+MAX_WORKERS =10
 server = None
-client_socket = None
 serverDisconnectMessage = "!EXIT"
 clientDisconnectMessage = "!DISCONNECT"
-GAME_ID = None
+
+# Number of current active threads
+numberOfWorkers = 0
+
+
+# Stores GAME IDs that were not finished
+unresolvedSessions = []
 
 # Winning positions in tic-tac-toe
 winPos = [
@@ -24,7 +31,7 @@ winPos = [
     [4,8,12]
 ]
 
-# Game Functions
+
 def checkWinner(GAME_STATE):
     global winPos
     
@@ -67,14 +74,14 @@ def moveBot(GAME_STATE, botPiece):
 
     return tempData
     
-    
-# Game Functions - Bit Operations
+# Bit Operations
 def binaryToInteger(binaryData):
     # Converts a string of binary data to it's integer equivalent 
     data = 0
     exp = 0
-    # Reverse data
-    for i in range(len(binaryData)-1, -1,-1):
+   
+    # Leftmost bit is the least significant bit
+    for i in range(len(binaryData)):
         data = data + (int(binaryData[i]) << exp)
         exp = exp + 1
     return data
@@ -89,7 +96,6 @@ def setBit(binaryData,bitNum):
     return binaryData # return an integer base 10 representation of the binaryData
 
 def clearBit(binaryData,bitNum):
-    # Expects a integer called binaryData which contains status about games and and integer called bitnum
    
     binaryData = binaryData - (binaryData & (1 << bitNum))
     return binaryData # return an integer base 10 representation of the binaryData
@@ -98,12 +104,14 @@ def integerToBinary(num,bit_len):
     # Return a string representation of the binary data
     binaryData = str(bin(num)).split('b')[1]
 
-    diff = bit_len - len(binaryData)
-    
+    diff = int(abs(bit_len - len(binaryData)))
+
     while diff != 0:
         binaryData = "0" + binaryData
         diff = diff - 1
-    return binaryData
+    
+    # Reverse results
+    return binaryData[::-1]
 
 def checkBit(binaryData, bitnum):
     # Expects an integer for binaryData and bitNum
@@ -111,7 +119,7 @@ def checkBit(binaryData, bitnum):
     return binaryData & (1 << bitnum)
 
 
-# Server-Side Functions
+# ServerFunctions
 
 def validAddress():
     # Validates the IP and Port number at the command line and returns the IP and Port as a tuple if both addres are valid. 
@@ -124,7 +132,7 @@ def validAddress():
         IP = sys.argv[1]
         PORT = sys.argv[2]
 
-        # A regex filter that validates an IPv4 Address
+        # A regex to validate an IPv4 Address
         isIPValid = re.search(r'^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
                               ,IP)
         if isIPValid == None:
@@ -139,8 +147,7 @@ def validAddress():
             exit(1)
         return (IP,PORT)
 
-def send(msg):
-    # Send a message to the server
+def send(msg,client_socket):
     
     # Encode the string in utf-8 format
     message = msg.encode(FORMAT)
@@ -153,8 +160,8 @@ def send(msg):
     client_socket.send(send_length)
     client_socket.send(message)
     
-def receive():
-    global client_socket
+def receive(client_socket):
+
     # Receive message from client
     
     msg_len = client_socket.recv(MAX_MSG_LEN).decode(FORMAT)
@@ -168,103 +175,143 @@ def receive():
         return message
     return msg_len
     
-def handle_client(client_address):
-    global client_socket
-    print(f"Accepted connection from {client_address[0]}:{client_address[1]}")    
+def handle_client(client_address,client_socket):
+    GAME_ID = None
     connected = True 
     global server
+    global unresolvedSessions
+    global numberOfWorkers
+    global MAX_WORKERS
+    
+    numberOfWorkers = numberOfWorkers + 1
+    
+    if len(unresolvedSessions) > 0:
+        print(f'GAME FLAG: 0000010000000')
+        print(f'INVALID GAME ID: Client cannot connect. GAME ID/s in progress')
+        for id in unresolvedSessions:
+            print(integerToBinary(id,14))
+        print('[CLOSING SESSION TO FREE SPACE]')
+        unresolvedSessions = []
+        send('invalid',client_socket)
+        numberOfWorkers = numberOfWorkers - 1
+        client_socket.close()
+        return
+    else:
+        send('valid',client_socket)
+        print(f"Accepted connection from {client_address[0]}:{client_address[1]}")    
+        print(f'[ACTIVE SESSIONS] : {numberOfWorkers}')
+
     
     while connected:
-        global GAME_ID
+
         # First message received by the server when the client connects
-        player_name = receive()
+        player_name = receive(client_socket)
         if player_name:
             # Disconnect client from the server
             if player_name == serverDisconnectMessage or player_name == clientDisconnectMessage:
                 connected = False
+                
+                unresolvedSessions.append(random.randint(0, 2**24 - 1))
+                print(f'[TIMEOUT ERROR] GAME FLAG: {random.randint(0,1)}0000100000000')
+                client_socket.close()
+                return
             
             print(f'Player Name: {player_name}')
             
             # Receive the game session ID
             if GAME_ID == None:
-                GAME_ID = binaryToInteger(receive())
+                GAME_ID = binaryToInteger(receive(client_socket))
             else:
-                binaryToInteger(receive()) # FLUSH OUT CONTENTS
+                binaryToInteger(receive(client_socket)) # FLUSH OUT CONTENTS
                 GAME_ID= -1
 
             # Generate an unsigned message ID
             MESSAGE_ID = random.randint(0, 2**8-1)
+
             GAME_FLAG = 0
             GAME_STATE = 0
-            print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}')
+            print(f'INITAL MESSAGE ID: {integerToBinary(MESSAGE_ID,8)} TO SEND TO PLAYER {player_name}')
             
             # Send initial message ID
-            send(integerToBinary(MESSAGE_ID,8))
+            send(integerToBinary(MESSAGE_ID,8),client_socket)
 
-            turn = receive()
+            turn = receive(client_socket)
             
             if GAME_ID == -1:
                 GAME_FLAG = setBit(GAME_FLAG,5)
-                send(integerToBinary(GAME_FLAG,14))
-                send('INVALID GAME ID: An existing match is ongoing')
+                send(integerToBinary(GAME_FLAG,14),client_socket)
+                send(f'INVALID GAME ID: An existing match is ongoing. Refused connection for {player_name}',client_socket)
+                numberOfWorkers = numberOfWorkers - 1
                 client_socket.close()
-                sys.exit(1)
+                return
             else:
-                send(integerToBinary(0,14))
-                send('')
+                send(integerToBinary(0,14),client_socket)
+                send('',client_socket)
                 
                 
             if turn == "1":
-                send(f'PLAYER {player_name} TURN')
+                send(f'PLAYER {player_name} TURN',client_socket)
 
             # Game start in server
             while connected:
                 bitNum = 0
-                ID = binaryToInteger(receive())                        
-                GAME_STATE = binaryToInteger(receive())
-                GAME_FLAG = binaryToInteger(receive())
-                TEMP_MESSAGE_ID = binaryToInteger(receive())
+                ID = binaryToInteger(receive(client_socket))                        
+                GAME_STATE = binaryToInteger(receive(client_socket))
+                GAME_FLAG = binaryToInteger(receive(client_socket))
+                TEMP_MESSAGE_ID = binaryToInteger(receive(client_socket))
                 
-                print('DATA RECEIVED FROM PLAYER')
+                print(f'DATA RECEIVED FROM PLAYER {player_name}')
                 print(f'GAME FLAG: {integerToBinary(GAME_FLAG,14)}')
                 print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
                 print(f'MESSAGE ID: {integerToBinary(TEMP_MESSAGE_ID,8)}\n')
                 
-
                 if GAME_FLAG == 0:
+                    print(f'UNEXPECTED INTERRUPT FROM: {player_name}. Closing Connection')
+                    unresolvedSessions.append(GAME_ID)
                     connected == False
+                    numberOfWorkers = numberOfWorkers - 1
                     client_socket.close()
                     return
                 
-                # Rollover if message id reaches the max size
-                if TEMP_MESSAGE_ID + 1 == 2 ** 8: 
-                    TEMP_MESSAGE_ID = -1
 
                  # Examine player movement
                 invalidState = checkBit(GAME_FLAG,5)
 
+
                 if invalidState != 0:
-                    send(integerToBinary(GAME_STATE,18))
-                    send(integerToBinary(GAME_FLAG,14))
-                    send(integerToBinary(MESSAGE_ID,8))
-                    print('INVALID GAME STATE: Closing server')
-                    send('INVALID GAME STATE: Invalid Player Move')
-                    sys.exit(1)
+
+                    send(integerToBinary(GAME_STATE,18),client_socket)
+                    send(integerToBinary(GAME_FLAG,14),client_socket)
+                    send(integerToBinary(MESSAGE_ID,8),client_socket)
+                    print(f'INVALID GAME STATE: Closing server. Error caused by {player_name}')
+                    send(f'INVALID GAME STATE: Player {player_name} made an invalid move',client_socket)
+                    numberOfWorkers = numberOfWorkers - 1
+                    print(f'[ACTIVE CONNECTIONS]: {numberOfWorkers}')
+                    client_socket.close()
+                    return
 
                 # Examine if the the difference between the previous message id and the current
-                elif int(abs(TEMP_MESSAGE_ID - MESSAGE_ID)) > 1 and int(abs(TEMP_MESSAGE_ID - MESSAGE_ID)) != 2**8-1:
+                elif (int(abs(TEMP_MESSAGE_ID - MESSAGE_ID)) != 2**8 -1 and int(abs(TEMP_MESSAGE_ID - MESSAGE_ID)) != 1) :
                     GAME_FLAG = setBit(GAME_FLAG,5)
-                    send(integerToBinary(GAME_STATE,18))
-                    send(integerToBinary(GAME_FLAG,14))
-                    send(integerToBinary(MESSAGE_ID + 1,8))
-                    print('INVALID MESSAGE ID: Closing server')
-                    send('INVALID MESSAGE ID: Order of messages are not mantained')
-                    sys.exit(1)
-                    
+                    send(integerToBinary(GAME_STATE,18),client_socket)
+                    send(integerToBinary(GAME_FLAG,14),client_socket)
+                    send(integerToBinary(MESSAGE_ID + 1,8),client_socket)   
+
+                    send(f'INVALID MESSAGE ID: Order of messages are not mantained for player {player_name}',client_socket)
+                    print(f'INVALID MESSAGE ID: Closing server. Error caused by player {player_name}')
+                    numberOfWorkers = numberOfWorkers - 1
+                    print(f'[ACTIVE CONNECTIONS]: {numberOfWorkers}')
+
+                    client_socket.close()
+                    return
+                
                 MESSAGE_ID = TEMP_MESSAGE_ID
                 MESSAGE_ID = MESSAGE_ID + 1
                 
-                print('DATA TO SEND TO PLAYER')
+                if(MESSAGE_ID > 255):
+                    MESSAGE_ID = 0
+                
+                print(f'DATA TO SEND TO PLAYER {player_name}')
                 if checkBit(GAME_FLAG,0) == 0:
                     botMove = 2 # Bot has a move of 'O'
                 else:
@@ -273,9 +320,9 @@ def handle_client(client_address):
                 # Check last move player made
                 if checkWinner(GAME_STATE): 
                     if botMove == 1:
-                        bitNum = 2
-                    else:
                         bitNum = 3
+                    else:
+                        bitNum = 2
                     GAME_FLAG = setBit(GAME_FLAG,bitNum)
 
                     print(f'GAME ID: {integerToBinary(GAME_ID,24)}')
@@ -283,11 +330,10 @@ def handle_client(client_address):
                     print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
                     print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
                     
-
-                    send(integerToBinary(GAME_STATE,18))
-                    send(integerToBinary(GAME_FLAG,14))
-                    send(integerToBinary(MESSAGE_ID,8)) 
-                    send(f"PLAYER {player_name} WINS")
+                    send(integerToBinary(GAME_STATE,18),client_socket)
+                    send(integerToBinary(GAME_FLAG,14),client_socket)
+                    send(integerToBinary(MESSAGE_ID,8),client_socket) 
+                    send(f"PLAYER {player_name} WINS",client_socket)
                     break
                     
                 elif checkTie(GAME_STATE):
@@ -297,15 +343,19 @@ def handle_client(client_address):
                     print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
                     
                     GAME_FLAG = setBit(GAME_FLAG,4)
-                    send(integerToBinary(GAME_STATE,18))
-                    send(integerToBinary(GAME_FLAG,14))
-                    send(integerToBinary(MESSAGE_ID,8))
-                    send("IT'S A DRAW") 
+                    send(integerToBinary(GAME_STATE,18),client_socket)
+                    send(integerToBinary(GAME_FLAG,14),client_socket)
+                    send(integerToBinary(MESSAGE_ID,8),client_socket)
+
+                    send("IT'S A DRAW",client_socket) 
+
                     break
                 
                 else:    
+                    
                     # Move AI bot
                     GAME_STATE = moveBot(GAME_STATE, botMove)
+
                     # Change turn 
                     if botMove == 1:
                         GAME_FLAG = setBit(GAME_FLAG,1)
@@ -326,24 +376,26 @@ def handle_client(client_address):
                         
 
                         GAME_FLAG = setBit(GAME_FLAG,bitNum)
-                        send(integerToBinary(GAME_STATE,18))
-                        send(integerToBinary(GAME_FLAG,14))
-                        send(integerToBinary(MESSAGE_ID,8)) 
-                        send("PLAYER COMPUTER WINS")
+                        send(integerToBinary(GAME_STATE,18),client_socket)
+                        send(integerToBinary(GAME_FLAG,14),client_socket)
+                        send(integerToBinary(MESSAGE_ID,8),client_socket) 
+                        send(f"PLAYER COMPUTER WINS, PLAYER {player_name} LOSES",client_socket)
                         break
                     # Check if is a tie
                     elif checkTie(GAME_STATE):
+
                         GAME_FLAG = setBit(GAME_FLAG,4)
 
                         print(f'GAME ID: {integerToBinary(GAME_ID,24)}')
                         print(f'GAME FLAG: {integerToBinary(GAME_FLAG,14)}')
                         print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
                         print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
-                        
-                        send(integerToBinary(GAME_STATE,18))
-                        send(integerToBinary(GAME_FLAG,14))
-                        send(integerToBinary(MESSAGE_ID,8))
-                        send("IT'S A DRAW")
+
+
+                        send(integerToBinary(GAME_STATE,18),client_socket)
+                        send(integerToBinary(GAME_FLAG,14),client_socket)
+                        send(integerToBinary(MESSAGE_ID,8),client_socket)
+                        send("IT'S A DRAW",client_socket)
                         break
                     else:
 
@@ -352,35 +404,48 @@ def handle_client(client_address):
                         print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
                         print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
                         
-                        send(integerToBinary(GAME_STATE,18))
-                        send(integerToBinary(GAME_FLAG,14))
-                        send(integerToBinary(MESSAGE_ID,8))
-                        send(f'PLAYER {player_name} TURN')
-            restartGame = receive()
+                        send(integerToBinary(GAME_STATE,18),client_socket)
+                        send(integerToBinary(GAME_FLAG,14),client_socket)
+                        send(integerToBinary(MESSAGE_ID,8),client_socket)
+                        send(f'PLAYER {player_name} TURN',client_socket)
+            restartGame = receive(client_socket)
             if restartGame == 'N' and connected:
                 # Close connection from client 
                 GAME_ID = None
                 connected = False
+                print(f'CLOSING CONNECTION for {player_name}')
+                numberOfWorkers = numberOfWorkers - 1
+                print(f'[ACTIVE CONNECTIONS]: {numberOfWorkers}')
+
             else:
                 GAME_ID = None
     client_socket.close()
         
 def run_server(ADDR):
     global server
-    global client_socket
-    
+    global unresolvedSessions
+    global numberOfWorkers
+    global MAX_WORKERS
+
+    # Create threadpoolexecutor object
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
     # Create socket object
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
     # bind the socket to a specific address and port and listen for incoming connections
     server.bind(ADDR)
+
+    print(f'Server listening on {ADDR[0]}:{ADDR[1]}')
+    
     while True:
+
         server.listen()
-        print(f'Server listening on {ADDR[0]}:{ADDR[1]}')
-        
+         
         # Accept connection from client 
         client_socket, client_address = server.accept()
-        handle_client(client_address)
+                
+        pool.submit(handle_client,client_address,client_socket)
         
     
 
