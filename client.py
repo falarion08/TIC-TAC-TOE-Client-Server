@@ -2,21 +2,23 @@ import sys
 import re
 import socket
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 FORMAT = 'utf-8'
-MAX_MSG_LEN = 65000 # 1 character is 1 byte
+MAX_MSG_LEN = 65000 # 1 character is 1 byte,
+MAX_IDLE_TIME = 60 * 5 # Max idle time for a player in seconds
+
 server = None
 serverDisconnectMessage = "!EXIT"
 clientDisconnectMessage = "!DISCONNECT"
 client = None
 
-# Game Functions - Bit Operations
 def binaryToInteger(binaryData):
-    # Converts a string of binary data to it's integer equivalent 
+    # The function has an integer parameter as input
     data = 0
     exp = 0
-    # Reverse data
-    for i in range(len(binaryData)-1, -1,-1):
+
+    for i in range(len(binaryData)):
         data = data + (int(binaryData[i]) << exp)
         exp = exp + 1
     return data
@@ -40,19 +42,20 @@ def integerToBinary(num,bit_len):
     # Return a string representation of the binary data
     binaryData = str(bin(num)).split('b')[1]
 
-    diff = bit_len - len(binaryData)
+    diff = int(abs(bit_len - len(binaryData)))
     
     while diff != 0:
         binaryData = "0" + binaryData
-        diff = diff - 1
-    return binaryData
+        diff = diff - 1    
+    # Reverse data 
+    return binaryData[::-1]
 
 def checkBit(binaryData, bitnum):
     # Expects an integer for binaryData and bitNum
     
     return binaryData & (1 << bitnum)
 
-# Game Functions - Display Operations
+#Display
 def printBoard(pieces):
     row = 1
     piece_num = 0
@@ -115,12 +118,13 @@ def getBoardPieces(gameState):
     # Returns a list of 'X', 'O', or ' ' string characters
     return pieces
 
-# Game Function - User Movement Functions
+# User Movement Functions
 def examineGameState(gameState,pos):
-    
-    # Examine if proper binary data is entered by the user
+# gameState - a string of of binary
+
+    # check if binary data is entered by the user
     if len(gameState) == 18:
-        # Examine if the string data are integers
+        # check if the string data are integers
         try:
             binaryToInteger(gameState)
         except:
@@ -132,7 +136,7 @@ def examineGameState(gameState,pos):
         
         stateNum = binaryToInteger(gameState)
         
-        # Examine if there is a "11" present into a 2-bit subfield
+        # Check if there is a "11" present into a 2-bit subfield
         while stateNum > 0:
             if stateNum & 3 == 3:
                 return False
@@ -140,7 +144,7 @@ def examineGameState(gameState,pos):
         
          
         stateNum = binaryToInteger(gameState)
-        # Examine if the position entered by the user is occupied
+        # check if the position entered by the user is occupied
         if ((stateNum >> 2*(pos - 1)) & 3) != 0:
             return False
         # Game state is valid
@@ -150,8 +154,12 @@ def examineGameState(gameState,pos):
 
 def validateUserInput(gameState):
     # Player should choose a value between 1-9 (Valid Moves)
-    choice = input('Pick your move between[1-9]: ')
-    
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        choice = pool.submit(input,'Pick your move between[1-9]: ').result(timeout=MAX_IDLE_TIME)
+    except:
+        print("[TIME OUT ERROR] Maximum idle time exceeded")
+        return clientDisconnectMessage
     if choice == clientDisconnectMessage:
         return clientDisconnectMessage
     
@@ -182,7 +190,7 @@ def validAddress():
         IP = sys.argv[1]
         PORT = sys.argv[2]
 
-        # A regex filter that validates an IPv4 Address
+        # using regex that will validate an IPv4 Address
         isIPValid = re.search(r'^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
                               ,IP)
         if isIPValid == None:
@@ -199,7 +207,7 @@ def validAddress():
 
 def send(msg):
     # Send a message to the server
-    
+
     # Encode the string in utf-8 format
     message = msg.encode(FORMAT)
     msg_len = len(message)
@@ -215,7 +223,6 @@ def send(msg):
 def receive():
     # Receive message from server
     global client
-    
     msg_len = client.recv(MAX_MSG_LEN).decode(FORMAT)
     
     if msg_len:
@@ -231,6 +238,10 @@ def receive():
 def run_client(ADDRESS):
     global serverDisconnectMessage
     global client
+
+    # Create a thread pool
+    pool = ThreadPoolExecutor(max_workers=1)
+    
     # Create socket object 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
@@ -240,22 +251,34 @@ def run_client(ADDRESS):
     player_move = 0
     restartGame = 'N'
     playerName = ""
+    
+    # Validate if it is not a GAME ID error
+    isGameValid = receive()
+    
+    if isGameValid != 'valid':
+        print('INVALID GAME ID')
+        connected = False 
     while connected:
         if restartGame == 'N':
-            playerName = input("Enter your name: ")
-            send(playerName)
-            
-            if playerName == serverDisconnectMessage:
-                connected = False
+            try:
+                playerName = pool.submit(input, 'Enter your name:').result(timeout=MAX_IDLE_TIME)
+                send(playerName)
+            except:
+                print("\nTIME OUT ERROR: No response from the client")
+                playerName = clientDisconnectMessage
+                send(clientDisconnectMessage)
+            if playerName == clientDisconnectMessage:
+                sys.exit()
+                
         else:
             send(playerName)
         # Turn 0 - Computer First, Turn 1 - Player First
-        turn = random.randint(0,1)      
+        turn = 0
         # Generate randomized unsigned int between 0 to 2^24 - 1
         GAME_ID = random.randint(0,2**24-1)
         
-        # Send the gameID in progress
-        
+        # Sends the gameID in progress
+
         send(integerToBinary(GAME_ID,24)) 
         
         GAME_FLAG = 0
@@ -284,7 +307,8 @@ def run_client(ADDRESS):
         # Start the game and continuously examine if someone wins or it is a tie
         while connected and checkBit(GAME_FLAG,2) == 0 and checkBit(GAME_FLAG,3) == 0 and checkBit(GAME_FLAG,4) == 0:
             if turn == 0:
-
+                if MESSAGE_ID == 2**8 - 1:
+                    MESSAGE_ID = -1
                 GAME_FLAG = setBit(GAME_FLAG,0)
                 GAME_FLAG = clearBit(GAME_FLAG,1)
     
@@ -295,8 +319,26 @@ def run_client(ADDRESS):
 
                 GAME_STATE = binaryToInteger(receive())
                 GAME_FLAG = binaryToInteger(receive())
-                MESSAGE_ID =  binaryToInteger(receive())             
+                MESSAGE_ID =  binaryToInteger(receive())
                 SERVER_MESSAGE = receive()
+
+
+                if checkBit(GAME_FLAG,2) != 0 or checkBit(GAME_FLAG,3) != 0 or checkBit(GAME_FLAG,4) != 0:
+                    
+                    pieces = getBoardPieces(integerToBinary(GAME_STATE,18))
+                    printBoard(pieces)
+                    
+                    print(f'GAME ID: {integerToBinary(GAME_ID,24)}')
+                    print(f'GAME FLAG: {integerToBinary(GAME_FLAG,14)}')
+                    print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
+                    print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
+                    print(SERVER_MESSAGE)
+                    break
+                # Close server on error
+                elif player_move == -1 or "INVALID" in SERVER_MESSAGE:
+                    print(f'GAME FLAGS: {integerToBinary(GAME_FLAG,14)}')
+                    print(SERVER_MESSAGE)
+                    sys.exit(1)
 
                 pieces = getBoardPieces(integerToBinary(GAME_STATE,18))
                 printBoard(pieces)
@@ -310,23 +352,9 @@ def run_client(ADDRESS):
                 print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
                 print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
 
-
-                if checkBit(GAME_FLAG,2) != 0 or checkBit(GAME_FLAG,3) != 0 or checkBit(GAME_FLAG,4) != 0:
-                    print(f'GAME ID: {integerToBinary(GAME_ID,24)}')
-                    print(f'GAME FLAG: {integerToBinary(GAME_FLAG,14)}')
-                    print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
-                    print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
-                    print(SERVER_MESSAGE)
-                    break
-                # Close server on error
-                elif player_move == -1 or "INVALID" in SERVER_MESSAGE:
-                    print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
-                    print(SERVER_MESSAGE)
-                    sys.exit(1)
-
                 print(SERVER_MESSAGE)
                 player_move = validateUserInput(GAME_STATE)
-                
+
                 # Disconnect client from server
                 if player_move == clientDisconnectMessage:
                     send(integerToBinary(GAME_ID,24))
@@ -349,8 +377,6 @@ def run_client(ADDRESS):
                 # Rollover if message id reaches the max size
                 if MESSAGE_ID + 1 == 2 ** 8: 
                     MESSAGE_ID = -1
-
-
                 
             else:
                 GAME_FLAG = setBit(GAME_FLAG,0)
@@ -362,8 +388,9 @@ def run_client(ADDRESS):
                 print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
                 
                 print(SERVER_MESSAGE)
+
                 player_move = validateUserInput(GAME_STATE)
-                
+
                 # Disconnect client from server
                 if player_move == clientDisconnectMessage:
                     send(integerToBinary(GAME_ID,24))
@@ -373,7 +400,7 @@ def run_client(ADDRESS):
                     print("[DISCONNECTING CLIENT FROM SERVER]")
                     client.close()
                     sys.exit()
-                # If the move is not legal modify the error bit in the game flag
+                # If the move is not modify the error bit in the game flag
                 if player_move == -1:
                     GAME_FLAG = setBit(GAME_FLAG,5)
                 else:
@@ -404,16 +431,19 @@ def run_client(ADDRESS):
                 SERVER_MESSAGE = receive()
 
                 if checkBit(GAME_FLAG,2) != 0 or checkBit(GAME_FLAG,3) != 0 or checkBit(GAME_FLAG,4) != 0:
+                    if(checkBit(GAME_FLAG,3) != 0):
+                        pieces = getBoardPieces(integerToBinary(GAME_STATE,18))
+                        printBoard(pieces)
+            
                     print(f'GAME ID: {integerToBinary(GAME_ID,24)}')
                     print(f'GAME FLAG: {integerToBinary(GAME_FLAG,14)}')
                     print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
                     print(f'MESSAGE ID: {integerToBinary(MESSAGE_ID,8)}\n')
                     print(SERVER_MESSAGE)
                     break
-                
                 # Close server on error
                 elif player_move == -1 or "INVALID" in SERVER_MESSAGE:
-                    print(f'GAME STATE: {integerToBinary(GAME_STATE,18)}')
+                    print(f'GAME FLAGS: {integerToBinary(GAME_FLAG,14)}')
                     print(SERVER_MESSAGE)
                     sys.exit(1)
                 else:
@@ -425,14 +455,21 @@ def run_client(ADDRESS):
         
         restartGame = input('RESTART GAME WITH SAME USERNAME?(Y/N):')
         
-        while restartGame != 'Y' and restartGame != 'N':
-            restartGame = input('RESTART GAME WITH SAME USERNAME?(Y/N):')
+        try:
+            while restartGame != 'Y' and restartGame != 'N':
+                restartGame = pool.submit(input,'RESTART GAME WITH SAME USERNAME?(Y/N):').result(timeout=MAX_IDLE_TIME)
+        except:
+            print(f'TIME OUT ERROR GAME ID {GAME_ID}')
+            restartGame = 'N'
+            
         send(restartGame)
+        
         if restartGame == 'N':
             connected = False
             print("[DISCONNECTING CLIENT FROM SERVER]")
 
     # Remove client from the server
+    pool.shutdown()
     client.close()
       
 
